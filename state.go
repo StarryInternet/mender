@@ -881,7 +881,11 @@ func (is *UpdateInstallState) Handle(ctx *StateContext, c Controller) (State, bo
 		case datastore.RebootTypeNone:
 			// Do nothing.
 
-		case datastore.RebootTypeCustom, datastore.RebootTypeAutomatic:
+		case datastore.RebootTypeCustom:
+			fallthrough
+		case datastore.RebootTypeAutomatic:
+			fallthrough
+		case datastore.RebootTypeAutomaticSkipStatusReport:
 			// Go to reboot state if at least one payload requested it.
 			return NewUpdateRebootState(is.Update()), false
 
@@ -909,6 +913,8 @@ func (is *UpdateInstallState) handleRebootType(ctx *StateContext, c Controller) 
 			err = is.Update().RebootRequested.Set(n, datastore.RebootTypeCustom)
 		case installer.AutomaticReboot:
 			err = is.Update().RebootRequested.Set(n, datastore.RebootTypeAutomatic)
+		case installer.AutomaticRebootSkipStatusReport:
+			err = is.Update().RebootRequested.Set(n, datastore.RebootTypeAutomaticSkipStatusReport)
 		default:
 			state, cancelled := is.HandleError(ctx, c, NewFatalError(errors.New(
 				"Unknown reply from NeedsReboot. Should not happen")))
@@ -1428,9 +1434,31 @@ func (e *UpdateRebootState) Handle(ctx *StateContext, c Controller) (State, bool
 
 	log.Debug("handling reboot state")
 
-	merr := c.ReportUpdateStatus(e.Update(), client.StatusRebooting)
-	if merr != nil && merr.IsFatal() {
-		return NewUpdateRollbackState(e.Update()), false
+	// Avoid attempting to report status to the server if any payload indicated a reboot of
+	// type `RebootTypeAutomaticSkipStatusReport` (even if other modules exist which
+	// use other reboot types, we need to assume that upstream connectivity will be broken by
+	// the payload which indicated `RebootTypeAutomaticSkipStatusReport`).
+	shouldPhoneHomeBeforeReboot := true
+	for n, _ := range c.GetInstallers() {
+		rebootRequested, err := e.Update().RebootRequested.Get(n)
+		if err != nil {
+			return e.HandleError(ctx, c, NewTransientError(errors.Wrap(
+				err, "Unable to get requested reboot type")))
+		}
+		if rebootRequested == datastore.RebootTypeAutomaticSkipStatusReport {
+			log.Warnf(
+				"Found update with reboot type %s - NOT reporting status before reboot!",
+				datastore.RebootTypeAutomaticSkipStatusReport)
+
+			shouldPhoneHomeBeforeReboot = false
+		}
+	}
+
+	if shouldPhoneHomeBeforeReboot {
+		merr := c.ReportUpdateStatus(e.Update(), client.StatusRebooting)
+		if merr != nil && merr.IsFatal() {
+			return NewUpdateRollbackState(e.Update()), false
+		}
 	}
 
 	log.Info("rebooting device(s)")
@@ -1449,7 +1477,7 @@ func (e *UpdateRebootState) Handle(ctx *StateContext, c Controller) (State, bool
 				return NewUpdateRollbackState(e.Update()), false
 			}
 
-		case datastore.RebootTypeAutomatic:
+		case datastore.RebootTypeAutomatic, datastore.RebootTypeAutomaticSkipStatusReport:
 			systemRebootRequested = true
 		}
 	}
@@ -1549,7 +1577,11 @@ func (rs *UpdateRollbackState) Handle(ctx *StateContext, c Controller) (State, b
 		case datastore.RebootTypeNone:
 			// Do nothing.
 
-		case datastore.RebootTypeCustom, datastore.RebootTypeAutomatic:
+		case datastore.RebootTypeCustom:
+			fallthrough
+		case datastore.RebootTypeAutomatic:
+			fallthrough
+		case datastore.RebootTypeAutomaticSkipStatusReport:
 			// Enter rollback reboot state if at least one payload
 			// asked for it.
 			log.Debug("will try to rollback reboot the device")
@@ -1607,7 +1639,7 @@ func (rs *UpdateRollbackRebootState) Handle(ctx *StateContext, c Controller) (St
 				// VerifyRollbackReboot state regardless.
 			}
 
-		case datastore.RebootTypeAutomatic:
+		case datastore.RebootTypeAutomatic, datastore.RebootTypeAutomaticSkipStatusReport:
 			systemRebootRequested = true
 		}
 	}
